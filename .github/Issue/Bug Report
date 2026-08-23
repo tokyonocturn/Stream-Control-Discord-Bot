@@ -1,0 +1,43 @@
+---
+name: Bug report
+about: Something in the bot is broken or not working as expected
+title: "[Bug] "
+labels: bug
+assignees: ''
+---
+
+**Describe the bug**
+A clear and concise description of what went wrong.
+
+**Which part of the bot is affected?**
+- [ ] `/obs` commands (action, scene, sources, toggle, browser-add, browser-url)
+- [ ] `/obsjoin` (voice channel audio)
+- [ ] Twitch chat bridge
+- [ ] Twitch subscriber role sync
+- [ ] `/twitchcategory` or `/twitchname`
+- [ ] `/link` or `/unlink`
+- [ ] `/delete`
+- [ ] Something else (describe below)
+
+**To reproduce**
+Steps to reproduce the behavior:
+1. Run '...' command with these options
+2. See error or unexpected result
+
+**Expected behavior**
+A clear and concise description of what you expected to happen instead.
+
+**Console output / error message**
+Paste the relevant lines from your bot's console output here. Wrap them in a code block:
+```
+paste console output here
+```
+
+**Environment**
+- Node.js version: [e.g. 18.19.0, run `node -v`]
+- OS running the bot: [e.g. Windows 11, Ubuntu 22.04]
+- OBS Studio version: [e.g. 30.1.2, only relevant for `/obs` bugs]
+- obs-websocket version: [Tools → WebSocket Server Settings in OBS, only relevant for `/obs` bugs]
+
+**Additional context**
+Add any other context about the problem here, including whether it happens every time or only sometimes.
