@@ -102,7 +102,7 @@ Give your mod role access to whichever text channels they will run commands from
 
 1. **Clone the repo and install dependencies**
    ```bash
-   git clone <your repo url>
+   git clone <https://github.com/tokyonocturn/Stream-Control-Discord-Bot.git>
    cd <your repo folder>
    npm install
    ```
