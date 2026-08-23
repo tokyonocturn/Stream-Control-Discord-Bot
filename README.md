@@ -1,4 +1,4 @@
-# OBS Discord Control Bot
+OBS Discord Control Bot
 
 A two client Discord bot that lets you and your moderators run your stream from a phone. It connects straight to OBS over its WebSocket server, so you can start or stop your stream and recording, switch scenes, enable or disable sources, and add or edit browser sources, all from a Discord slash command. A companion Twitch bot bridges Twitch chat into Discord, keeps a subscriber role in sync, and updates your Twitch title and category.
 
@@ -148,6 +148,16 @@ Copy `.env.example` to `.env` and fill in every value; the bot will not start co
 | `OBS_PORT` | OBS WebSocket port, default `4455` |
 | `OBS_PASSWORD` | OBS WebSocket server password |
 | `AUDIO_DEVICE` | Optional. Windows audio device name for `/obsjoin`. Defaults to `CABLE Output (VB-Audio Virtual Cable)` if left blank |
+
+Versioning
+
+This project follows semantic versioning: vMAJOR.MINOR.PATCH, for example v1.0.0.
+
+MAJOR a breaking change. Something in .env, a command, or how the bot behaves changed in a way that could stop an existing setup from working. Read the release notes before updating.
+MINOR a new feature. Something was added, existing commands still work the same way. Safe to update.
+PATCH a bug fix only, nothing new added. Always safe to update.
+
+Every tagged version has its own entry on the repo's Releases page listing exactly what changed since the previous tag. That page is the changelog, check there before pulling a new version if you want to know what is different.
 
 ## How your mods can use this
 
