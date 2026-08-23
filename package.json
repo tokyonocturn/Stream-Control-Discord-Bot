@@ -1,0 +1,18 @@
+{
+  "name": "obs-discord-twitch-bot",
+  "version": "1.0.0",
+  "description": "A dual-client Discord bot that controls OBS remotely (stream, record, scenes, sources, browser sources) via obs-websocket, plus a Twitch integration bot for chat bridging, subscriber role sync, and stream info updates.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@discordjs/voice": "^0.17.0",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "libsodium-wrappers": "^0.7.15",
+    "obs-websocket-js": "^5.0.6",
+    "ws": "^8.18.0"
+  }
+}
