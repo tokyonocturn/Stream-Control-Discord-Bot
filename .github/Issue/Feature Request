@@ -1,0 +1,26 @@
+---
+name: Feature request
+about: Suggest an idea for this bot
+title: "[Feature] "
+labels: enhancement, needs-triage
+assignees: tokyonocturn
+---
+
+**Is your feature request related to a problem? Please describe.**
+A clear and concise description of what the problem is. Ex. I always have to tab back to my PC when [...]
+
+**Describe the solution you'd like**
+A clear and concise description of what you want to happen. If this involves a new or changed slash command, include what the command and its options should look like, e.g. `/obs mute source:<name>`.
+
+**Which part of the bot would this affect?**
+- [ ] `/obs` commands (OBS control)
+- [ ] Twitch integration (chat bridge, subscriber sync, category/title)
+- [ ] Discord moderation (`/delete`, role gating, logging)
+- [ ] Voice/audio (`/obsjoin`)
+- [ ] Something new
+
+**Describe alternatives you've considered**
+A clear and concise description of any alternative solutions or workarounds you've tried.
+
+**Additional context**
+Add any other context or screenshots about the feature request here.
