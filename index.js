@@ -22,10 +22,115 @@ const CHANNELS = {
     donoInfo: process.env.CHANNEL_DONO_INFO,
     activeSubs: process.env.CHANNEL_ACTIVE_SUBS,
     twitchChat: process.env.CHANNEL_TWITCH_CHAT,
-    modActions: process.env.CHANNEL_MOD_ACTIONS
+    modActions: process.env.CHANNEL_MOD_ACTIONS,
+    commandLog: process.env.COMMAND_LOG_CHANNEL_ID
 };
 
 const EMBED_COLOR = 0xAAFFFF;
+
+// --- Source type catalogue for /obs source-add ---
+// Maps the friendly name shown in Discord to the internal OBS "input kind" id.
+// These kind ids are what OBS itself uses internally (obs-websocket just passes
+// them straight through to CreateInput), so they're stable across OBS installs
+// on the same platform. "Scene" is handled specially below since adding an
+// existing scene into another scene is a CreateSceneItem call, not CreateInput.
+const SOURCE_TYPES = [
+    { name: 'Application Audio Capture (BETA)', value: 'wasapi_process_output_capture' },
+    { name: 'Audio Input Capture', value: 'wasapi_input_capture' },
+    { name: 'Audio Output Capture', value: 'wasapi_output_capture' },
+    { name: 'Browser Source', value: 'browser_source' },
+    { name: 'Color Source', value: 'color_source_v3' },
+    { name: 'Display Capture', value: 'monitor_capture' },
+    { name: 'Game Capture', value: 'game_capture' },
+    { name: 'Image', value: 'image_source' },
+    { name: 'Image Slide Show', value: 'slideshow' },
+    { name: 'Media Source', value: 'ffmpeg_source' },
+    { name: 'Scene', value: 'scene' },
+    { name: 'Text (GDI+)', value: 'text_gdiplus_v3' },
+    { name: 'Video Capture Device', value: 'dshow_input' },
+    { name: 'VLC Video Source', value: 'vlc_source' },
+    { name: 'Window Capture', value: 'window_capture' },
+    { name: 'Text (FreeType 2) [Legacy]', value: 'text_ft2_source_v2' }
+];
+
+// Builds a best-effort inputSettings object for a given OBS input kind from the
+// simple, common options exposed in the slash command. Anything unusual or
+// advanced (playlists, exact device ids, capture-mode flags, etc.) can be
+// layered on top with the optional raw "settings_json" option, which is
+// shallow-merged in last so it always wins.
+function buildSourceSettings(type, { url, device, width, height, text, settingsJson } = {}) {
+    let settings = {};
+    switch (type) {
+        case 'browser_source':
+            settings = { url: url || 'https://example.com', width: width || 1920, height: height || 1080 };
+            break;
+        case 'color_source_v3':
+            settings = { width: width || 1920, height: height || 1080 };
+            break;
+        case 'image_source':
+            settings = { file: url || device || '' };
+            break;
+        case 'ffmpeg_source':
+            settings = { local_file: url || '', is_local_file: true };
+            break;
+        case 'dshow_input':
+            settings = device ? { video_device_id: device } : {};
+            break;
+        case 'window_capture':
+            settings = device ? { window: device } : {};
+            break;
+        case 'monitor_capture':
+            settings = device ? { monitor_id: device } : {};
+            break;
+        case 'game_capture':
+            settings = device ? { capture_mode: 'window', window: device } : { capture_mode: 'any_fullscreen' };
+            break;
+        case 'text_gdiplus_v3':
+        case 'text_ft2_source_v2':
+            settings = { text: text || '' };
+            break;
+        case 'vlc_source':
+            settings = url ? { playlist: [{ value: url, selected: false, hidden: false }] } : {};
+            break;
+        case 'wasapi_input_capture':
+        case 'wasapi_output_capture':
+        case 'wasapi_process_output_capture':
+            settings = device ? { device_id: device } : {};
+            break;
+        default:
+            settings = {};
+    }
+
+    if (settingsJson) {
+        let parsed;
+        try {
+            parsed = JSON.parse(settingsJson);
+        } catch (e) {
+            throw new Error(`settings_json wasn't valid JSON: ${e.message}`);
+        }
+        settings = { ...settings, ...parsed };
+    }
+
+    return settings;
+}
+
+// Audio mixer actions available on /obs audio, mirroring Advanced Audio Properties.
+const AUDIO_ACTIONS = [
+    { name: 'Mute', value: 'mute' },
+    { name: 'Unmute', value: 'unmute' },
+    { name: 'Toggle Mute', value: 'toggle-mute' },
+    { name: 'Set Volume (dB)', value: 'set-volume' },
+    { name: 'Set Balance (0.0 left – 1.0 right)', value: 'set-balance' },
+    { name: 'Set Sync Offset (ms)', value: 'set-sync-offset' },
+    { name: 'Set Monitoring', value: 'set-monitoring' },
+    { name: 'Toggle Audio Track (1-6)', value: 'toggle-track' }
+];
+
+const MONITOR_TYPES = [
+    { name: 'Monitor Off', value: 'OBS_MONITORING_TYPE_NONE' },
+    { name: 'Monitor Only (mute output)', value: 'OBS_MONITORING_TYPE_MONITOR_ONLY' },
+    { name: 'Monitor and Output', value: 'OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT' }
+];
 
 const LINKS_FILE = path.join(__dirname, 'twitch_links.json');
 
@@ -53,6 +158,58 @@ function hasAccess(member) {
     if (!member) return false;
     if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
     return member.roles.cache.some(role => ALLOWED_ROLE_IDS.includes(role.id));
+}
+
+// Renders every option a slash command was invoked with (including nested
+// subcommands/subcommand groups) into a short "name:value" string for logging.
+function formatInteractionOptions(interaction) {
+    try {
+        const raw = interaction.options?.data || [];
+        const parts = [];
+
+        function walk(options) {
+            for (const opt of options) {
+                // Subcommand / subcommand group: descend into its nested options
+                if (opt.options && opt.options.length) {
+                    parts.push(opt.name);
+                    walk(opt.options);
+                } else if (opt.value !== undefined) {
+                    parts.push(`${opt.name}:${opt.value}`);
+                }
+            }
+        }
+
+        walk(raw);
+        return parts.join(' ');
+    } catch (e) {
+        return '';
+    }
+}
+
+// Logs every command invocation (regardless of success/failure/permission
+// result) to the channel set in COMMAND_LOG_CHANNEL_ID, if configured. This is
+// a full audit trail, separate from CHANNEL_MOD_ACTIONS (which only logs OBS
+// changes that actually took effect).
+async function logCommandUsage(interaction, { allowed = true } = {}) {
+    if (!CHANNELS.commandLog) return;
+    try {
+        const guild = interaction.guild;
+        if (!guild) return;
+        const logChannel = await guild.channels.fetch(CHANNELS.commandLog).catch(() => null);
+        if (!logChannel) return;
+
+        const optionsText = formatInteractionOptions(interaction);
+        const commandLine = `/${interaction.commandName}${optionsText ? ' ' + optionsText : ''}`;
+
+        const embed = new EmbedBuilder()
+            .setDescription(`${allowed ? '📋' : '⛔'} **${interaction.user.tag}** ran \`${commandLine}\` in <#${interaction.channelId}>${allowed ? '' : ' — **denied** (no permission)'}`)
+            .setColor(allowed ? EMBED_COLOR : 0xFF5555)
+            .setTimestamp();
+
+        await logChannel.send({ embeds: [embed] });
+    } catch (e) {
+        console.error('Failed to send command log message:', e.message);
+    }
 }
 
 // OBS WebSocket Client Setup
@@ -404,6 +561,164 @@ async function buildMasterCommands() {
                     )
                     .addStringOption(option => option.setName('url').setDescription('New URL to load').setRequired(true))
             )
+            .addSubcommand(sub =>
+                sub.setName('source-add')
+                    .setDescription('Add any OBS source type to the current scene')
+                    .addStringOption(option =>
+                        option.setName('type')
+                            .setDescription('Source type to create')
+                            .setRequired(true)
+                            .addChoices(...SOURCE_TYPES)
+                    )
+                    .addStringOption(option =>
+                        option.setName('name')
+                            .setDescription('Name for the new source (or, for type: Scene, the existing scene to add)')
+                            .setRequired(true)
+                            .setAutocomplete(true)
+                    )
+                    .addStringOption(option => option.setName('url').setDescription('URL/file path (browser, media, image, VLC)').setRequired(false))
+                    .addStringOption(option => option.setName('device').setDescription('Device/window/monitor id (capture sources)').setRequired(false))
+                    .addStringOption(option => option.setName('text').setDescription('Text content (Text/GDI+/FreeType sources)').setRequired(false))
+                    .addIntegerOption(option => option.setName('width').setDescription('Width in px (browser/color source)').setRequired(false))
+                    .addIntegerOption(option => option.setName('height').setDescription('Height in px (browser/color source)').setRequired(false))
+                    .addStringOption(option => option.setName('settings_json').setDescription('Advanced: raw JSON merged into the source settings').setRequired(false))
+            )
+            .addSubcommand(sub =>
+                sub.setName('properties-get')
+                    .setDescription("Show a source's current settings (Properties) as JSON")
+                    .addStringOption(option =>
+                        option.setName('source')
+                            .setDescription('Source to inspect (start typing to search)')
+                            .setRequired(true)
+                            .setAutocomplete(true)
+                    )
+            )
+            .addSubcommand(sub =>
+                sub.setName('properties-set')
+                    .setDescription("Update a source's settings (Properties) from JSON")
+                    .addStringOption(option =>
+                        option.setName('source')
+                            .setDescription('Source to update (start typing to search)')
+                            .setRequired(true)
+                            .setAutocomplete(true)
+                    )
+                    .addStringOption(option => option.setName('settings_json').setDescription('JSON object of settings fields to change').setRequired(true))
+            )
+            .addSubcommand(sub =>
+                sub.setName('filters')
+                    .setDescription('List the filters on a source and whether each is enabled')
+                    .addStringOption(option =>
+                        option.setName('source')
+                            .setDescription('Source to inspect (start typing to search)')
+                            .setRequired(true)
+                            .setAutocomplete(true)
+                    )
+            )
+            .addSubcommand(sub =>
+                sub.setName('filter-toggle')
+                    .setDescription('Enable or disable a filter on a source')
+                    .addStringOption(option =>
+                        option.setName('source')
+                            .setDescription('Source the filter is on (start typing to search)')
+                            .setRequired(true)
+                            .setAutocomplete(true)
+                    )
+                    .addStringOption(option =>
+                        option.setName('filter')
+                            .setDescription('Filter to toggle (start typing to search)')
+                            .setRequired(true)
+                            .setAutocomplete(true)
+                    )
+                    .addStringOption(option =>
+                        option.setName('state')
+                            .setDescription('Enable or disable the filter')
+                            .setRequired(true)
+                            .addChoices({ name: 'Disable', value: 'disable' }, { name: 'Enable', value: 'enable' })
+                    )
+            )
+            .addSubcommand(sub =>
+                sub.setName('audio')
+                    .setDescription('Audio Mixer controls: volume, mute, balance, sync offset, monitoring, tracks')
+                    .addStringOption(option =>
+                        option.setName('source')
+                            .setDescription('Audio source to control (start typing to search)')
+                            .setRequired(true)
+                            .setAutocomplete(true)
+                    )
+                    .addStringOption(option =>
+                        option.setName('action')
+                            .setDescription('What to change')
+                            .setRequired(true)
+                            .addChoices(...AUDIO_ACTIONS)
+                    )
+                    .addStringOption(option =>
+                        option.setName('value')
+                            .setDescription('Value for the action (dB / 0-1 / ms / monitor type / track #), where needed')
+                            .setRequired(false)
+                            .setAutocomplete(true)
+                    )
+            )
+            .addSubcommand(sub =>
+                sub.setName('profile')
+                    .setDescription('Switch the active OBS Profile')
+                    .addStringOption(option =>
+                        option.setName('name')
+                            .setDescription('Profile to switch to')
+                            .setRequired(true)
+                            .setAutocomplete(true)
+                    )
+            )
+            .addSubcommand(sub =>
+                sub.setName('scene-collection')
+                    .setDescription('Switch the active OBS Scene Collection')
+                    .addStringOption(option =>
+                        option.setName('name')
+                            .setDescription('Scene collection to switch to')
+                            .setRequired(true)
+                            .setAutocomplete(true)
+                    )
+            )
+            .addSubcommand(sub =>
+                sub.setName('studio-mode')
+                    .setDescription('Enable or disable Studio Mode')
+                    .addStringOption(option =>
+                        option.setName('state')
+                            .setDescription('Enable or disable')
+                            .setRequired(true)
+                            .addChoices({ name: 'Enable', value: 'enable' }, { name: 'Disable', value: 'disable' })
+                    )
+            )
+            .addSubcommand(sub =>
+                sub.setName('transition')
+                    .setDescription('Change the current scene transition and/or its duration')
+                    .addStringOption(option =>
+                        option.setName('name')
+                            .setDescription('Transition to use')
+                            .setRequired(false)
+                            .setAutocomplete(true)
+                    )
+                    .addIntegerOption(option => option.setName('duration_ms').setDescription('Transition duration in ms').setRequired(false))
+            )
+            .addSubcommand(sub =>
+                sub.setName('virtualcam')
+                    .setDescription('Start, stop, or toggle the Virtual Camera')
+                    .addStringOption(option =>
+                        option.setName('state')
+                            .setDescription('Action')
+                            .setRequired(true)
+                            .addChoices({ name: 'Start', value: 'start' }, { name: 'Stop', value: 'stop' }, { name: 'Toggle', value: 'toggle' })
+                    )
+            )
+            .addSubcommand(sub =>
+                sub.setName('replay-buffer')
+                    .setDescription('Start, stop, or save the Replay Buffer')
+                    .addStringOption(option =>
+                        option.setName('state')
+                            .setDescription('Action')
+                            .setRequired(true)
+                            .addChoices({ name: 'Start', value: 'start' }, { name: 'Stop', value: 'stop' }, { name: 'Save', value: 'save' })
+                    )
+            )
     ];
 }
 
@@ -497,37 +812,87 @@ masterClient.on('messageCreate', async message => {
 });
 
 masterClient.on('interactionCreate', async interaction => {
-    // --- Autocomplete for source names (toggle / browser-url) ---
+    // --- Autocomplete: source/filter/profile/scene-collection/transition names, live from OBS ---
     if (interaction.isAutocomplete()) {
         if (interaction.commandName !== 'obs') return;
         const focused = interaction.options.getFocused(true);
+        const sub = interaction.options.getSubcommand();
+        const query = (focused.value || '').toLowerCase();
 
-        if (focused.name !== 'source') {
-            return interaction.respond([]).catch(() => {});
+        function respondNames(names) {
+            const filtered = names
+                .filter(name => name.toLowerCase().includes(query))
+                .slice(0, 25)
+                .map(name => ({ name, value: name }));
+            return interaction.respond(filtered).catch(() => {});
         }
 
         try {
             if (!obs.identified) await connectOBS();
 
-            const sub = interaction.options.getSubcommand();
-            let names = [];
-
-            if (sub === 'toggle') {
-                const { currentProgramSceneName } = await obs.call('GetCurrentProgramScene');
-                const { sceneItems } = await obs.call('GetSceneItemList', { sceneName: currentProgramSceneName });
-                names = sceneItems.map(item => item.sourceName);
-            } else if (sub === 'browser-url') {
-                const { inputs } = await obs.call('GetInputList', { inputKind: 'browser_source' });
-                names = inputs.map(input => input.inputName);
+            // "value" on /obs audio depends on which action was picked
+            if (focused.name === 'value' && sub === 'audio') {
+                const action = interaction.options.getString('action');
+                if (action === 'set-monitoring') {
+                    const opts = MONITOR_TYPES.filter(m => m.name.toLowerCase().includes(query)).slice(0, 25);
+                    return await interaction.respond(opts).catch(() => {});
+                } else if (action === 'toggle-track') {
+                    const opts = [1, 2, 3, 4, 5, 6].map(n => ({ name: `Track ${n}`, value: String(n) }));
+                    return await interaction.respond(opts).catch(() => {});
+                }
+                return await interaction.respond([]).catch(() => {});
             }
 
-            const query = (focused.value || '').toLowerCase();
-            const filtered = names
-                .filter(name => name.toLowerCase().includes(query))
-                .slice(0, 25)
-                .map(name => ({ name, value: name }));
+            // "name" option: means different things depending on the subcommand
+            if (focused.name === 'name') {
+                if (sub === 'source-add') {
+                    const type = interaction.options.getString('type');
+                    if (type === 'scene') {
+                        const { scenes } = await obs.call('GetSceneList');
+                        return await respondNames(scenes.map(s => s.sceneName));
+                    }
+                    return await interaction.respond([]).catch(() => {});
+                } else if (sub === 'profile') {
+                    const { profiles } = await obs.call('GetProfileList');
+                    return await respondNames(profiles);
+                } else if (sub === 'scene-collection') {
+                    const { sceneCollections } = await obs.call('GetSceneCollectionList');
+                    return await respondNames(sceneCollections);
+                } else if (sub === 'transition') {
+                    const { transitions } = await obs.call('GetSceneTransitionList');
+                    return await respondNames(transitions.map(t => t.transitionName));
+                }
+                return await interaction.respond([]).catch(() => {});
+            }
 
-            await interaction.respond(filtered);
+            // "filter" option: filters that exist on the already-picked source
+            if (focused.name === 'filter' && sub === 'filter-toggle') {
+                const sourceName = interaction.options.getString('source');
+                if (!sourceName) return await interaction.respond([]).catch(() => {});
+                const { filters } = await obs.call('GetSourceFilterList', { sourceName });
+                return await respondNames(filters.map(f => f.filterName));
+            }
+
+            // "source" option: scope depends on the subcommand
+            if (focused.name === 'source') {
+                let names = [];
+                if (sub === 'toggle') {
+                    const { currentProgramSceneName } = await obs.call('GetCurrentProgramScene');
+                    const { sceneItems } = await obs.call('GetSceneItemList', { sceneName: currentProgramSceneName });
+                    names = sceneItems.map(item => item.sourceName);
+                } else if (sub === 'browser-url') {
+                    const { inputs } = await obs.call('GetInputList', { inputKind: 'browser_source' });
+                    names = inputs.map(input => input.inputName);
+                } else {
+                    // properties-get, properties-set, filters, filter-toggle, audio:
+                    // any input in OBS, not just the current scene
+                    const { inputs } = await obs.call('GetInputList');
+                    names = inputs.map(input => input.inputName);
+                }
+                return await respondNames(names);
+            }
+
+            await interaction.respond([]).catch(() => {});
         } catch (err) {
             console.error('OBS autocomplete error:', err.message);
             await interaction.respond([]).catch(() => {});
@@ -539,8 +904,11 @@ masterClient.on('interactionCreate', async interaction => {
     if (interaction.commandName !== 'obs') return;
 
     if (!hasAccess(interaction.member)) {
+        await logCommandUsage(interaction, { allowed: false });
         return interaction.reply({ content: '❌ Nice try, twin. You don\'t have permission to use this.', flags: [MessageFlags.Ephemeral] });
     }
+
+    await logCommandUsage(interaction);
 
     const subcommand = interaction.options.getSubcommand();
     await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
@@ -662,6 +1030,221 @@ masterClient.on('interactionCreate', async interaction => {
             const responseText = `🔗 Updated **${sourceName}** to load a new URL.`;
             await interaction.editReply(responseText);
             await logObsAction(`🎛️ **${interaction.user.tag}** used \`/obs browser-url\` on **${sourceName}**:\n${url}`);
+
+        } else if (subcommand === 'source-add') {
+            const type = interaction.options.getString('type');
+            const name = interaction.options.getString('name');
+            const { currentProgramSceneName } = await obs.call('GetCurrentProgramScene');
+
+            let responseText;
+            if (type === 'scene') {
+                if (name === currentProgramSceneName) {
+                    await interaction.editReply(`❌ Can't add **${name}** to itself.`);
+                    return;
+                }
+                await obs.call('CreateSceneItem', {
+                    sceneName: currentProgramSceneName,
+                    sourceName: name,
+                    sceneItemEnabled: true
+                });
+                responseText = `🎬 Added scene **${name}** into **${currentProgramSceneName}**.`;
+            } else {
+                const url = interaction.options.getString('url');
+                const device = interaction.options.getString('device');
+                const text = interaction.options.getString('text');
+                const width = interaction.options.getInteger('width');
+                const height = interaction.options.getInteger('height');
+                const settingsJson = interaction.options.getString('settings_json');
+
+                const inputSettings = buildSourceSettings(type, { url, device, width, height, text, settingsJson });
+                const typeLabel = SOURCE_TYPES.find(t => t.value === type)?.name || type;
+
+                await obs.call('CreateInput', {
+                    sceneName: currentProgramSceneName,
+                    inputName: name,
+                    inputKind: type,
+                    inputSettings,
+                    sceneItemEnabled: true
+                });
+                responseText = `✨ Added **${typeLabel}** source **${name}** to **${currentProgramSceneName}**.`;
+            }
+
+            await interaction.editReply(responseText);
+            await logObsAction(`🎛️ **${interaction.user.tag}** used \`/obs source-add\`: ${responseText}`);
+
+        } else if (subcommand === 'properties-get') {
+            const sourceName = interaction.options.getString('source');
+            const { inputSettings, inputKind } = await obs.call('GetInputSettings', { inputName: sourceName });
+
+            let json = JSON.stringify(inputSettings, null, 2);
+            if (json.length > 3800) json = json.slice(0, 3800) + '\n… (truncated)';
+
+            const embed = new EmbedBuilder()
+                .setTitle(`⚙️ Properties: ${sourceName} (${inputKind})`)
+                .setDescription('```json\n' + json + '\n```')
+                .setColor(EMBED_COLOR)
+                .setTimestamp();
+
+            await interaction.editReply({ embeds: [embed] });
+
+        } else if (subcommand === 'properties-set') {
+            const sourceName = interaction.options.getString('source');
+            const settingsJson = interaction.options.getString('settings_json');
+
+            let inputSettings;
+            try {
+                inputSettings = JSON.parse(settingsJson);
+            } catch (e) {
+                await interaction.editReply(`❌ settings_json wasn't valid JSON: ${e.message}`);
+                return;
+            }
+
+            await obs.call('SetInputSettings', { inputName: sourceName, inputSettings, overlay: true });
+
+            const responseText = `⚙️ Updated properties on **${sourceName}**.`;
+            await interaction.editReply(responseText);
+            await logObsAction(`🎛️ **${interaction.user.tag}** used \`/obs properties-set\` on **${sourceName}**:\n\`\`\`json\n${settingsJson}\n\`\`\``);
+
+        } else if (subcommand === 'filters') {
+            const sourceName = interaction.options.getString('source');
+            const { filters } = await obs.call('GetSourceFilterList', { sourceName });
+
+            if (!filters.length) {
+                await interaction.editReply(`📭 **${sourceName}** has no filters.`);
+                return;
+            }
+
+            const lines = filters.map(f => `${f.filterEnabled ? '🟢' : '🔴'}  ${f.filterName} _(${f.filterKind})_`);
+            const embed = new EmbedBuilder()
+                .setTitle(`🧪 Filters on "${sourceName}"`)
+                .setDescription(lines.join('\n'))
+                .setColor(EMBED_COLOR)
+                .setTimestamp();
+
+            await interaction.editReply({ embeds: [embed] });
+
+        } else if (subcommand === 'filter-toggle') {
+            const sourceName = interaction.options.getString('source');
+            const filterName = interaction.options.getString('filter');
+            const state = interaction.options.getString('state');
+            const enabled = state === 'enable';
+
+            await obs.call('SetSourceFilterEnabled', { sourceName, filterName, filterEnabled: enabled });
+
+            const responseText = `${enabled ? '🟢 Enabled' : '🔴 Disabled'} filter **${filterName}** on **${sourceName}**.`;
+            await interaction.editReply(responseText);
+            await logObsAction(`🎛️ **${interaction.user.tag}** used \`/obs filter-toggle\`: ${responseText}`);
+
+        } else if (subcommand === 'audio') {
+            const sourceName = interaction.options.getString('source');
+            const action = interaction.options.getString('action');
+            const value = interaction.options.getString('value');
+            let responseText;
+
+            if (action === 'mute' || action === 'unmute') {
+                const muted = action === 'mute';
+                await obs.call('SetInputMute', { inputName: sourceName, inputMuted: muted });
+                responseText = `${muted ? '🔇 Muted' : '🔊 Unmuted'} **${sourceName}**.`;
+            } else if (action === 'toggle-mute') {
+                const { inputMuted } = await obs.call('ToggleInputMute', { inputName: sourceName });
+                responseText = `${inputMuted ? '🔇 Muted' : '🔊 Unmuted'} **${sourceName}**.`;
+            } else if (action === 'set-volume') {
+                const db = parseFloat(value);
+                if (Number.isNaN(db)) { await interaction.editReply('❌ `value` needs to be a number of dB, e.g. `-6`.'); return; }
+                await obs.call('SetInputVolume', { inputName: sourceName, inputVolumeDb: db });
+                responseText = `🔊 Set **${sourceName}** volume to **${db} dB**.`;
+            } else if (action === 'set-balance') {
+                const bal = parseFloat(value);
+                if (Number.isNaN(bal) || bal < 0 || bal > 1) { await interaction.editReply('❌ `value` needs to be between `0.0` (left) and `1.0` (right).'); return; }
+                await obs.call('SetInputAudioBalance', { inputName: sourceName, inputAudioBalance: bal });
+                responseText = `⚖️ Set **${sourceName}** balance to **${bal}**.`;
+            } else if (action === 'set-sync-offset') {
+                const ms = parseInt(value, 10);
+                if (Number.isNaN(ms)) { await interaction.editReply('❌ `value` needs to be a whole number of milliseconds.'); return; }
+                await obs.call('SetInputAudioSyncOffset', { inputName: sourceName, inputAudioSyncOffset: ms });
+                responseText = `🕒 Set **${sourceName}** sync offset to **${ms} ms**.`;
+            } else if (action === 'set-monitoring') {
+                const monitorType = MONITOR_TYPES.find(m => m.value === value || m.name === value)?.value;
+                if (!monitorType) { await interaction.editReply('❌ Pick a monitoring value from the autocomplete list.'); return; }
+                await obs.call('SetInputAudioMonitorType', { inputName: sourceName, monitorType });
+                responseText = `🎚️ Set **${sourceName}** monitoring to **${MONITOR_TYPES.find(m => m.value === monitorType).name}**.`;
+            } else if (action === 'toggle-track') {
+                const track = parseInt(value, 10);
+                if (Number.isNaN(track) || track < 1 || track > 6) { await interaction.editReply('❌ `value` needs to be a track number, 1-6.'); return; }
+                const { inputAudioTracks } = await obs.call('GetInputAudioTracks', { inputName: sourceName });
+                const key = String(track);
+                const newState = !inputAudioTracks[key];
+                await obs.call('SetInputAudioTracks', { inputName: sourceName, inputAudioTracks: { [key]: newState } });
+                responseText = `${newState ? '🟢 Enabled' : '🔴 Disabled'} **${sourceName}** on audio track **${track}**.`;
+            } else {
+                await interaction.editReply('❌ Unknown audio action.');
+                return;
+            }
+
+            await interaction.editReply(responseText);
+            await logObsAction(`🎛️ **${interaction.user.tag}** used \`/obs audio ${action}\` on **${sourceName}**: ${responseText}`);
+
+        } else if (subcommand === 'profile') {
+            const name = interaction.options.getString('name');
+            await obs.call('SetCurrentProfile', { profileName: name });
+            const responseText = `👤 Switched Profile to **${name}**.`;
+            await interaction.editReply(responseText);
+            await logObsAction(`🎛️ **${interaction.user.tag}** used \`/obs profile\`: ${responseText}`);
+
+        } else if (subcommand === 'scene-collection') {
+            const name = interaction.options.getString('name');
+            await obs.call('SetCurrentSceneCollection', { sceneCollectionName: name });
+            const responseText = `📁 Switched Scene Collection to **${name}**.`;
+            await interaction.editReply(responseText);
+            await logObsAction(`🎛️ **${interaction.user.tag}** used \`/obs scene-collection\`: ${responseText}`);
+
+        } else if (subcommand === 'studio-mode') {
+            const state = interaction.options.getString('state');
+            const enabled = state === 'enable';
+            await obs.call('SetStudioModeEnabled', { studioModeEnabled: enabled });
+            const responseText = `${enabled ? '🟢 Enabled' : '🔴 Disabled'} Studio Mode.`;
+            await interaction.editReply(responseText);
+            await logObsAction(`🎛️ **${interaction.user.tag}** used \`/obs studio-mode\`: ${responseText}`);
+
+        } else if (subcommand === 'transition') {
+            const name = interaction.options.getString('name');
+            const durationMs = interaction.options.getInteger('duration_ms');
+
+            if (!name && !durationMs) {
+                await interaction.editReply('❌ Give a transition name, a duration, or both.');
+                return;
+            }
+
+            if (name) await obs.call('SetCurrentSceneTransition', { transitionName: name });
+            if (durationMs) await obs.call('SetCurrentSceneTransitionDuration', { transitionDuration: durationMs });
+
+            const parts = [];
+            if (name) parts.push(`transition to **${name}**`);
+            if (durationMs) parts.push(`duration to **${durationMs}ms**`);
+            const responseText = `🔀 Set ${parts.join(' and ')}.`;
+
+            await interaction.editReply(responseText);
+            await logObsAction(`🎛️ **${interaction.user.tag}** used \`/obs transition\`: ${responseText}`);
+
+        } else if (subcommand === 'virtualcam') {
+            const state = interaction.options.getString('state');
+            let responseText;
+            if (state === 'start') { await obs.call('StartVirtualCam'); responseText = '📷 Virtual Camera started.'; }
+            else if (state === 'stop') { await obs.call('StopVirtualCam'); responseText = '📷 Virtual Camera stopped.'; }
+            else { const { outputActive } = await obs.call('ToggleVirtualCam'); responseText = `📷 Virtual Camera ${outputActive ? 'started' : 'stopped'}.`; }
+
+            await interaction.editReply(responseText);
+            await logObsAction(`🎛️ **${interaction.user.tag}** used \`/obs virtualcam ${state}\`: ${responseText}`);
+
+        } else if (subcommand === 'replay-buffer') {
+            const state = interaction.options.getString('state');
+            let responseText;
+            if (state === 'start') { await obs.call('StartReplayBuffer'); responseText = '⏮️ Replay Buffer started.'; }
+            else if (state === 'stop') { await obs.call('StopReplayBuffer'); responseText = '⏮️ Replay Buffer stopped.'; }
+            else { await obs.call('SaveReplayBuffer'); responseText = '💾 Replay saved.'; }
+
+            await interaction.editReply(responseText);
+            await logObsAction(`🎛️ **${interaction.user.tag}** used \`/obs replay-buffer ${state}\`: ${responseText}`);
         }
     } catch (err) {
         console.error('OBS Websocket command error:', err);
@@ -695,8 +1278,11 @@ twitchClient.on('interactionCreate', async interaction => {
     
     const protectedTwitchCommands = ['obsjoin', 'twitchcategory', 'twitchname'];
     if (protectedTwitchCommands.includes(commandName) && !hasAccess(member)) {
+        await logCommandUsage(interaction, { allowed: false });
         return interaction.reply({ content: '❌ Nice try, twin. You don\'t have permission to use this.', flags: [MessageFlags.Ephemeral] });
     }
+
+    await logCommandUsage(interaction);
 
     async function logAction(text, channelId = LOG_CHANNEL_ID) {
         try {
