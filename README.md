@@ -7,12 +7,23 @@ It was built for one specific problem: sometimes you are not sitting at your PC 
 ## Features
 
 **Master bot, `/obs`**
-- `/obs action` start stream, stop stream, start record, stop record
-- `/obs scene` switch to any scene, autocompleted live from whatever is currently in OBS
+- `/obs action` start stream, stop stream, start record, stop record, or switch to any scene (autocompleted live from whatever is currently in OBS)
 - `/obs sources` list every source in the current scene with its enabled or disabled status
 - `/obs toggle` enable or disable a specific source, with live autocomplete of source names
 - `/obs browser-add` add a new browser source to the current scene
 - `/obs browser-url` change the URL an existing browser source loads, for example swapping a VDO.Ninja link, with autocomplete
+- `/obs source-add` **(v2.0.0)** add any OBS input type to the current scene, not just browser source  Application Audio Capture, Audio Input/Output Capture, Color, Display Capture, Game Capture, Image, Image Slide Show, Media, Scene, Text (GDI+ and legacy FreeType 2), Video Capture Device, VLC Video, and Window Capture. Has a `settings_json` option as an escape hatch for anything not covered by the built-in fields
+- `/obs properties-get` / `/obs properties-set` **(v2.0.0)** view or edit any source's Properties as JSON, autocompleted from whatever inputs currently exist in OBS
+- `/obs filters` / `/obs filter-toggle` **(v2.0.0)** list a source's filters and enable/disable them, with autocomplete for both source and filter name
+- `/obs audio` **(v2.0.0)** full Audio Mixer access  mute/unmute, volume (dB), balance, sync offset, monitoring type, and per-track routing  matching Advanced Audio Properties
+- `/obs profile` / `/obs scene-collection` **(v2.0.0)** switch your whole Profile or Scene Collection, not just the active scene
+- `/obs studio-mode` **(v2.0.0)** enable or disable Studio Mode
+- `/obs transition` **(v2.0.0)** change the current scene transition and/or its duration
+- `/obs virtualcam` / `/obs replay-buffer` **(v2.0.0)** start, stop, toggle, or save these from your phone alongside stream/record
+
+All `/obs` autocomplete (scenes, sources, filters, profiles, scene collections, transitions) is live against OBS  nothing is hardcoded, so renaming or adding things in OBS shows up the next time you type the command, no bot restart needed.
+
+**Command auditing (new in v2.0.0)**  set `COMMAND_LOG_CHANNEL_ID` and every command run on either bot gets logged there: who ran it, the exact command and options, and whether they had permission. This is separate from `CHANNEL_MOD_ACTIONS`, which only logs OBS changes that actually took effect.
 
 **Twitch bot**
 - `/obsjoin` pulls the bot into a Discord voice channel and streams OBS audio into the VC through a virtual audio cable and ffmpeg
@@ -95,6 +106,7 @@ The bot expects a handful of roles and channels to already exist in your server.
 | Active subscriber list, kept updated | `CHANNEL_ACTIVE_SUBS` |
 | Twitch chat bridge output | `CHANNEL_TWITCH_CHAT` |
 | OBS and moderation action log | `CHANNEL_MOD_ACTIONS` |
+| Optional: full command audit log (every command, allowed or denied) | `COMMAND_LOG_CHANNEL_ID` |
 
 Give your mod role access to whichever text channels they will run commands from; `/obs`, `/obsjoin`, `/twitchcategory`, and `/twitchname` work in any channel the bot can see, they do not need to happen in a dedicated channel.
 
@@ -119,9 +131,9 @@ Give your mod role access to whichever text channels they will run commands from
    ```bash
    npm start
    ```
-   On every startup, the bot connects to OBS, scans it for the full list of current scenes and the sources inside each one, and logs what it found to the console so you can confirm the connection is working. It then registers `/obs` to your server with a scene option for every scene it detected. Nothing about your scene layout is hardcoded: rename, add, or remove scenes in OBS, restart the bot, and the command list updates to match. Sources for `/obs sources`, `/obs toggle`, and `/obs browser-url` are looked up live every time those commands run, so they always reflect what is in OBS right now with no restart needed.
+   On every startup, the bot connects to OBS, scans it for the full list of current scenes and the sources inside each one, and logs what it found to the console so you can confirm the connection is working. It then registers `/obs` to your server with a scene choice on `/obs action` for every scene it detected. Nothing about your scene layout is hardcoded: rename, add, or remove scenes in OBS, restart the bot, and the command list updates to match. Everything else that depends on live OBS state  sources, filters, profiles, scene collections, transitions  is looked up through autocomplete every time those commands run, so they always reflect what is in OBS right now with no restart needed.
 
-   If OBS is unreachable when the bot starts, `/obs scene` and `/obs toggle` will still register but will report an error until OBS is reachable and the bot is restarted, or until you run `/obs action` again after reconnecting.
+   If OBS is unreachable when the bot starts, `/obs action` and `/obs toggle` will still register but will report an error until OBS is reachable and the bot is restarted, or until you run `/obs action` again after reconnecting.
 
 ## Environment variables
 
@@ -144,6 +156,7 @@ Copy `.env.example` to `.env` and fill in every value; the bot will not start co
 | `CHANNEL_ACTIVE_SUBS` | Channel ID where the active subscriber list is posted and updated |
 | `CHANNEL_TWITCH_CHAT` | Channel ID the Twitch chat bridge posts into |
 | `CHANNEL_MOD_ACTIONS` | Channel ID where moderation and OBS action logs are posted |
+| `COMMAND_LOG_CHANNEL_ID` | Optional. Channel ID for a full audit log of every command run on either bot, who ran it, and whether it was allowed or denied. Leave blank to disable |
 | `OBS_IP` | IP address of the machine running OBS |
 | `OBS_PORT` | OBS WebSocket port, default `4455` |
 | `OBS_PASSWORD` | OBS WebSocket server password |
@@ -159,6 +172,16 @@ PATCH a bug fix only, nothing new added. Always safe to update.
 
 Every tagged version has its own entry on the repo's Releases page listing exactly what changed since the previous tag. That page is the changelog, check there before pulling a new version if you want to know what is different.
 
+**v2.0.0** adds ten new `/obs` subcommands (source-add, properties-get/set, filters, filter-toggle, audio, profile, scene-collection, studio-mode, transition, virtualcam, replay-buffer). No existing command, option, or `.env` variable changed behavior, so every existing setup keeps working exactly as before  the major bump reflects the size of the update rather than a breaking change.
+
+## What `/obs` can and can't reach
+
+`/obs` covers everything OBS exposes over its WebSocket remote-control protocol. Two different kinds of things are out of scope, for two different reasons:
+
+**Not reachable at all, by any Discord bot.** These live only in OBS's local UI and config files and aren't exposed as a remote-control request, so no amount of bot code can add them: Plugin Manager, Captions, Automatic Scene Switcher, Output Timer, Scripts, dock/layout changes (Horizontal Layout, hide/show inactive sources), WebSocket Server Settings itself, and nearly everything under Settings → General, Hotkeys, and Advanced (process priority, renderer, color format/space, network options, projectors, system tray, preview options).
+
+**Reachable, deliberately left out of this release.** Stream Service Settings (this would mean handling your stream key inside a Discord command) and base/output Video Settings (resolution/FPS  changing these while live can crash OBS's render pipeline). Open an issue if you want either added behind extra confirmation prompts.
+
 ## How your mods can use this
 
 The whole point of this bot is that stream control does not live only on your PC anymore. A trusted mod role, set in `ALLOWED_ROLE_IDS`, can run these commands from their phone at any time, without touching your computer.
@@ -167,7 +190,11 @@ The whole point of this bot is that stream control does not live only on your PC
 
 **You are IRL streaming through VDO.Ninja and have zero access to your desktop, laptop, or PC.** Your phone is the stream. If your VDO.Ninja room link needs to change mid stream, for example your session gets disconnected and you get handed a new room code, a mod runs `/obs browser-url source:VDO Ninja url:https://vdo.ninja/?view=NEWCODE` and the browser source in OBS updates instantly, no PC required. The same applies to adding a brand new overlay or camera feed mid stream with `/obs browser-add`.
 
-**Something looks wrong on screen and you cannot get to your setup fast enough.** `/obs sources` shows a mod exactly what is live in the current scene, so they can identify and disable the right source with `/obs toggle` instead of guessing.
+**Something looks wrong on screen and you cannot get to your setup fast enough.** `/obs sources` shows a mod exactly what is live in the current scene, so they can identify and disable the right source with `/obs toggle` instead of guessing. If it's a filter causing it (a chroma key, a color correction), `/obs filters source:Webcam` shows what's applied, and `/obs filter-toggle` turns the offending one off without touching anything else.
+
+**Your mic is clipping or someone forgot to unmute Desktop Audio.** A mod runs `/obs audio source:Mic/Aux action:Set Volume (dB) value:-6` or `/obs audio source:Desktop Audio action:Mute` right from Advanced Audio Properties' Discord equivalent, no walking over to the PC.
+
+**You're switching from a solo stream setup to a co-op one mid-session.** `/obs scene-collection name:Duo Setup` swaps your entire scene collection, and `/obs profile name:Co-op Audio` switches audio/output profiles to match, both from a phone.
 
 In every case, the action is logged with the mod's name and what they did to the channel set in `CHANNEL_MOD_ACTIONS`, so there is always a record of who changed what and when.
 
@@ -178,4 +205,4 @@ In every case, the action is logged with the mod's name and what they did to the
 
 ## Disclaimer
 
-This bot grants meaningful control over your stream, starting and stopping stream and recording, editing scenes and sources, bulk deleting messages, to whoever holds the roles in `ALLOWED_ROLE_IDS`. Keep that role list tight, and never commit your `.env` file.
+This bot grants meaningful control over your stream, to whoever holds the roles in `ALLOWED_ROLE_IDS`: starting and stopping stream and recording, editing scenes, sources, filters, and audio, switching profiles and scene collections, and bulk deleting messages. `/obs source-add`, `/obs properties-set`, and `/obs audio` can also write raw settings straight into OBS (via the optional `settings_json` fields), so treat that role list the same way you'd treat direct access to your OBS install. Keep it tight, and never commit your `.env` file.
