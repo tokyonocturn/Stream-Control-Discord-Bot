@@ -3,7 +3,7 @@
 ![Node.js](https://img.shields.io/badge/node-%3E%3D18-339933?logo=node.js&logoColor=white)
 ![JavaScript](https://img.shields.io/badge/javascript-ES2020-F7DF1E?logo=javascript&logoColor=black)
 ![discord.js](https://img.shields.io/badge/discord.js-v14-5865F2?logo=discord&logoColor=white)
-![Version](https://img.shields.io/badge/version-2.0.1-blue)
+![Version](https://img.shields.io/badge/version-2.3.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 A two client Discord bot that lets you and your moderators run your stream from a phone. It connects straight to OBS over its WebSocket server, so you can start or stop your stream and recording, switch scenes, enable or disable sources, and add or edit browser sources, all from a Discord slash command. A companion Twitch bot bridges Twitch chat into Discord, keeps a subscriber role in sync, and updates your Twitch title and category.
@@ -17,6 +17,24 @@ It was built for one specific problem: sometimes you are not sitting at your PC 
 - [obs-websocket-js](https://github.com/obs-websocket-community-projects/obs-websocket-js) — the OBS remote-control connection
 - [@discordjs/voice](https://github.com/discordjs/voice) + FFmpeg — piping OBS audio into a Discord voice channel for `/obsjoin`
 - Native `ws` and `https` — the Twitch IRC chat bridge and Twitch Helix API calls (no extra Twitch SDK)
+
+## Platform support
+
+| Platform | Status |
+|---|---|
+| Windows 10 | ✅ Fully supported, what this bot is built and tested against |
+| Windows 11 | ✅ Fully supported — nothing in this bot is Windows-10-specific; DirectShow, WASAPI, and VB-Cable all work the same on 11 |
+| Linux | ⚠️ Partial — see below |
+| macOS | ❌ Untested |
+
+Most of `/obs` talks to OBS purely over its WebSocket API, which looks identical to the bot no matter what OS OBS itself is running on — `action`, `sources`, `toggle`, `browser-add/url`, `properties-get/set`, `filters`, `filter-toggle`, `audio`, `profile`, `scene-collection`, `studio-mode`, `transition`, `virtualcam`, and `replay-buffer` should all work against a Linux (or Mac) OBS install already. The Twitch bot side (chat bridge, sub sync, `/link`, `/delete`) is pure Node and has no OS dependency either.
+
+Two things are genuinely Windows-only right now:
+
+1. **`/obsjoin`** hardcodes `-f dshow` (DirectShow) for FFmpeg and defaults `AUDIO_DEVICE` to a VB-Cable name. Linux needs `-f pulse` (or `alsa`) and different device naming; this hasn't been ported.
+2. **A few `/obs source-add` types** — Video Capture Device, Game Capture, and the Audio Input/Output/Application Audio Capture types — use Windows-only OBS input kinds (`dshow_input`, `game_capture`, `wasapi_*`). Linux OBS uses different kind IDs for capture (`v4l2_input`, PipeWire/Pulse-based audio) and has no real equivalent to Game Capture.
+
+If you're running OBS on Linux, everything except those two items should work today. Linux support for `/obsjoin` and the Windows-only source types is on the radar but not yet built or tested.
 
 ## Features
 
@@ -48,7 +66,25 @@ All `/obs` autocomplete (scenes, sources, filters, profiles, scene collections, 
 - Automatic Twitch subscriber to Discord role sync, every 30 minutes
 - Mirrors messages from specific channels into log channels for a record of what happened
 
-Every command that can change your stream, `/obs`, `/obsjoin`, `/twitchcategory`, `/twitchname`, is gated: it only works for server admins or the roles listed in `ALLOWED_ROLE_IDS`.
+**Kick integration (v2.3.0, optional)**
+- `/kickcategory`, `/kickname` update your Kick category and title from Discord
+- `/linkkick`, `/unlinkkick` let members link their Kick account for automatic sub role syncing
+- Kick chat bridged into Discord, plus a follow log, both via Kick's webhook events (not a poll — see setup below, this needs a public HTTPS URL pointed at the bot)
+- Sub/gift-sub role sync, granted as Kick delivers subscription webhook events
+
+**YouTube integration (v2.3.0, optional)**
+- `/youtubecategory`, `/youtubename` update your active live broadcast's category and title from Discord
+- `/linkyoutube`, `/unlinkyoutube` let members link their YouTube channel ID for automatic member role syncing
+- YouTube Live Chat bridged into Discord via polling (no public URL needed, unlike Kick)
+- Member role sync every 30 minutes — **only works if your channel has Memberships enabled**, see caveats below
+
+All `/obs` autocomplete (scenes, sources, filters, profiles, scene collections, transitions) is live against OBS — nothing is hardcoded, so renaming or adding things in OBS shows up the next time you type the command, no bot restart needed.
+
+**Command auditing (v2.0.0)** — set `COMMAND_LOG_CHANNEL_ID` and every command run on either bot gets logged there: who ran it, the exact command and options, and whether they had permission. This is separate from `CHANNEL_MOD_ACTIONS`, which only logs OBS changes that actually took effect.
+
+Every command that can change your stream, `/obs`, `/obsjoin`, `/twitchcategory`, `/twitchname`, `/kickcategory`, `/kickname`, `/youtubecategory`, `/youtubename`, is gated: it only works for server admins or the roles listed in `ALLOWED_ROLE_IDS`.
+
+Kick and YouTube are both fully optional — leave their env vars blank and the bot runs exactly as before, no errors, no extra ports opened.
 
 ## Requirements
 
@@ -102,6 +138,49 @@ Only needed if you want the Twitch chat bridge, subscriber sync, or `/twitchcate
 
 8. **Find your broadcaster ID**, the numeric Twitch user ID for your channel, using a lookup tool such as [streamweasels.com/tools/convert-twitch-username-to-user-id](https://www.streamweasels.com/tools/convert-twitch-username-to-user-id/). This goes into `TWITCH_BROADCASTER_ID`.
 
+## Creating the Kick application (optional)
+
+Only needed if you want `/kickcategory`, `/kickname`, Kick chat bridging, or Kick sub role sync. Skip this whole section and leave the `KICK_*` variables blank if you don't stream to Kick.
+
+1. Open [kick.com/settings/developer](https://kick.com/settings/developer). You'll need 2FA enabled on your Kick account first if it isn't already.
+
+2. Click **New Application** and name it something like `StreamControlDiscordBot`.
+
+3. **App description:** something like *"A custom Discord bot pair that gives you remote control over OBS (scenes, streaming, recording, sources, browser sources) straight from Discord slash commands, plus Twitch, Kick, and YouTube integration: subscriber role syncing, live chat bridging into Discord, and stream title/category updates."*
+
+4. **Redirect URL:** `https://localhost:3005` for local token generation (see step 6). This does not need to be reachable from the internet — it's separate from the webhook URL in step 7.
+
+5. **Scopes:** enable `user:read`, `channel:read`, `channel:write`, and `events:subscribe`.
+
+6. Once created, copy the **Client ID** and **Client Secret** into `KICK_CLIENT_ID` and `KICK_CLIENT_SECRET`. Then run through Kick's Authorization Code + PKCE flow once to get a refresh token — [Kick's own guide](https://docs.kick.com/getting-started/generating-tokens-oauth2-flow) walks through this, or use a PKCE-aware token generator. Put the resulting refresh token in `KICK_REFRESH_TOKEN`; the bot refreshes the access token itself from there on.
+
+7. **Set up your webhook URL in the same developer app settings.** This is what actually delivers chat/follow/sub events to the bot — Kick does not support polling for these, only signed webhook pushes. Point it at wherever `KICK_WEBHOOK_PORT` (default `3005`) is reachable from the public internet: a reverse proxy on your router, a service like ngrok/Cloudflare Tunnel, or a VPS if the bot doesn't run on your gaming PC. If this points nowhere reachable, everything else (category/title updates) still works — you just won't get Kick chat bridging or sub role sync.
+
+8. **Find your numeric Kick user ID** (not your username) — call `GET https://api.kick.com/public/v1/users` with your access token, or check your Kick profile page's underlying data. This goes into `KICK_BROADCASTER_USER_ID`.
+
+**Known caveats, read before relying on this:**
+- Kick's webhook signature format and the exact event names for gifted/renewal subs weren't something I could verify against a live Kick app while building this — `chat.message.sent` and `channel.followed` are confirmed against Kick's docs, the subscription event names are a best guess. If sub role sync doesn't fire, check your console output when a real sub happens and compare the event name against what's in the code (`startKickWebhookServer` in `index.js`).
+- If every webhook gets rejected as an invalid signature, set `KICK_VERIFY_WEBHOOK_SIGNATURE=false` in `.env` as a temporary workaround and open an issue with what you're seeing.
+
+## Creating the YouTube application (optional)
+
+Only needed if you want `/youtubecategory`, `/youtubename`, YouTube Live Chat bridging, or member role sync. Skip this whole section and leave the `YOUTUBE_*` variables blank if you don't stream to YouTube.
+
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/), create a project (or use an existing one), and enable the **YouTube Data API v3** under APIs & Services → Library.
+
+2. Under APIs & Services → OAuth consent screen, set it up for external/testing use (you don't need Google's app review for personal use — just add your own Google account as a test user).
+
+3. Under APIs & Services → Credentials, create an **OAuth client ID** of type "Desktop app" or "Web application." If Web application, add `http://localhost:3000/callback` (or similar) as an authorized redirect URI for the one-time token exchange.
+
+4. Copy the **Client ID** and **Client Secret** into `YOUTUBE_CLIENT_ID` and `YOUTUBE_CLIENT_SECRET`.
+
+5. **Get a refresh token once**, using the standard Google OAuth2 flow with scope `https://www.googleapis.com/auth/youtube` (title/category/chat) — and additionally `https://www.googleapis.com/auth/youtube.channel-memberships.creator` if you also want member role sync. [Google's OAuth2 playground](https://developers.google.com/oauthplayground) is the fastest way to do this for a one-person setup: paste in your client ID/secret under its settings gear, authorize with the scopes above, and copy the refresh token it gives you into `YOUTUBE_REFRESH_TOKEN`.
+
+**Known caveats, read before relying on this:**
+- Member role sync uses YouTube's separate Members API, which only works if your channel actually has Memberships enabled by YouTube (not all channels qualify) and needs the extra scope above. If it's not available for your channel, leave `YOUTUBE_SUB_ROLE_ID` blank — everything else (title/category/chat) works independently of this.
+- YouTube categories are a fixed platform list (Gaming, Entertainment, Music, etc.), not free text like Twitch/Kick — `/youtubecategory` will tell you if the name you typed doesn't match one exactly.
+- Title/category updates only work while you have an active live broadcast — start streaming to YouTube first.
+
 ## Discord server (guild) setup
 
 The bot expects a handful of roles and channels to already exist in your server. Enable Developer Mode first (User Settings, Advanced, Developer Mode), then right click any server, role, or channel to Copy ID.
@@ -111,6 +190,8 @@ The bot expects a handful of roles and channels to already exist in your server.
 |---|---|
 | One or more roles allowed to run OBS/admin commands (your mod team) | `ALLOWED_ROLE_IDS`, comma separated if more than one |
 | Role auto granted to linked, active Twitch subscribers | `TWITCH_SUB_ROLE_ID` |
+| Optional: role auto granted to linked Kick subscribers | `KICK_SUB_ROLE_ID` |
+| Optional: role auto granted to linked YouTube channel members | `YOUTUBE_SUB_ROLE_ID` |
 
 **Channels**
 | Purpose | Env variable |
@@ -119,10 +200,12 @@ The bot expects a handful of roles and channels to already exist in your server.
 | Donation info mirror | `CHANNEL_DONO_INFO` |
 | Active subscriber list, kept updated | `CHANNEL_ACTIVE_SUBS` |
 | Twitch chat bridge output | `CHANNEL_TWITCH_CHAT` |
+| Optional: Kick chat bridge output | `CHANNEL_KICK_CHAT` |
+| Optional: YouTube Live Chat bridge output | `CHANNEL_YOUTUBE_CHAT` |
 | OBS and moderation action log | `CHANNEL_MOD_ACTIONS` |
 | Optional: full command audit log (every command, allowed or denied) | `COMMAND_LOG_CHANNEL_ID` |
 
-Give your mod role access to whichever text channels they will run commands from; `/obs`, `/obsjoin`, `/twitchcategory`, and `/twitchname` work in any channel the bot can see, they do not need to happen in a dedicated channel.
+Give your mod role access to whichever text channels they will run commands from; `/obs`, `/obsjoin`, `/twitchcategory`, `/twitchname`, `/kickcategory`, `/kickname`, `/youtubecategory`, and `/youtubename` work in any channel the bot can see, they do not need to happen in a dedicated channel.
 
 ## Setup
 
@@ -162,6 +245,17 @@ Copy `.env.example` to `.env` and fill in every value; the bot will not start co
 | `TWITCH_BROADCASTER_ID` | Your numeric Twitch user/broadcaster ID |
 | `TWITCH_CHANNEL_NAME` | Twitch channel name to bridge chat from |
 | `TWITCH_BOT_USERNAME` | Username the bot logs into Twitch IRC as |
+| `KICK_CLIENT_ID` | Optional. Client ID of your Kick application |
+| `KICK_CLIENT_SECRET` | Optional. Client Secret of your Kick application |
+| `KICK_REFRESH_TOKEN` | Optional. OAuth refresh token for the Kick API, obtained once |
+| `KICK_BROADCASTER_USER_ID` | Optional. Your numeric Kick user ID |
+| `KICK_SUB_ROLE_ID` | Optional. Discord role ID granted to linked Kick subscribers |
+| `KICK_WEBHOOK_PORT` | Optional. Port the bot listens on for Kick webhook events, default `3005` |
+| `KICK_VERIFY_WEBHOOK_SIGNATURE` | Optional. Set to `false` to skip Kick webhook signature verification, default `true` |
+| `YOUTUBE_CLIENT_ID` | Optional. Client ID of your Google Cloud OAuth application |
+| `YOUTUBE_CLIENT_SECRET` | Optional. Client Secret of your Google Cloud OAuth application |
+| `YOUTUBE_REFRESH_TOKEN` | Optional. OAuth refresh token for the YouTube Data API, obtained once |
+| `YOUTUBE_SUB_ROLE_ID` | Optional. Discord role ID granted to linked, active YouTube channel members |
 | `TARGET_GUILD_ID` | Discord server (guild) ID the bot operates in |
 | `LOG_CHANNEL_ID` | Channel ID for general bot logs |
 | `TWITCH_SUB_ROLE_ID` | Discord role ID granted to active Twitch subscribers |
@@ -169,6 +263,8 @@ Copy `.env.example` to `.env` and fill in every value; the bot will not start co
 | `CHANNEL_DONO_INFO` | Channel ID mirrored for donation info |
 | `CHANNEL_ACTIVE_SUBS` | Channel ID where the active subscriber list is posted and updated |
 | `CHANNEL_TWITCH_CHAT` | Channel ID the Twitch chat bridge posts into |
+| `CHANNEL_KICK_CHAT` | Optional. Channel ID the Kick chat bridge posts into |
+| `CHANNEL_YOUTUBE_CHAT` | Optional. Channel ID the YouTube Live Chat bridge posts into |
 | `CHANNEL_MOD_ACTIONS` | Channel ID where moderation and OBS action logs are posted |
 | `COMMAND_LOG_CHANNEL_ID` | Optional. Channel ID for a full audit log of every command run on either bot, who ran it, and whether it was allowed or denied. Leave blank to disable |
 | `OBS_IP` | IP address of the machine running OBS |
@@ -215,8 +311,9 @@ In every case, the action is logged with the mod's name and what they did to the
 ## Notes on data files
 
 - `twitch_links.json` stores each Discord user's linked Twitch username and is created automatically the first time someone runs `/link`. It is git ignored since it contains real user data, see `twitch_links.example.json` for the expected shape.
+- `kick_links.json` / `youtube_links.json` work the same way for `/linkkick` and `/linkyoutube` — created automatically, git ignored.
 - `ffmpeg_debug.log` is written by `/obsjoin` and is also git ignored.
 
 ## Disclaimer
 
-This bot grants meaningful control over your stream, to whoever holds the roles in `ALLOWED_ROLE_IDS`: starting and stopping stream and recording, editing scenes, sources, filters, and audio, switching profiles and scene collections, and bulk deleting messages. `/obs source-add`, `/obs properties-set`, and `/obs audio` can also write raw settings straight into OBS (via the optional `settings_json` fields), so treat that role list the same way you'd treat direct access to your OBS install. Keep it tight, and never commit your `.env` file.
+This bot grants meaningful control over your stream, to whoever holds the roles in `ALLOWED_ROLE_IDS`: starting and stopping stream and recording, editing scenes, sources, filters, and audio, switching profiles and scene collections, updating your title/category on Twitch/Kick/YouTube, and bulk deleting messages. `/obs source-add`, `/obs properties-set`, and `/obs audio` can also write raw settings straight into OBS (via the optional `settings_json` fields), so treat that role list the same way you'd treat direct access to your OBS install. If you enable Kick, its webhook server (`KICK_WEBHOOK_PORT`) needs to be reachable from the public internet — only expose that one port, not your whole machine. Keep it tight, and never commit your `.env` file.

@@ -5,6 +5,8 @@ const { OBSWebSocket } = require('obs-websocket-js');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const http = require('http');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 const { spawn } = require('child_process');
 
@@ -22,6 +24,8 @@ const CHANNELS = {
     donoInfo: process.env.CHANNEL_DONO_INFO,
     activeSubs: process.env.CHANNEL_ACTIVE_SUBS,
     twitchChat: process.env.CHANNEL_TWITCH_CHAT,
+    kickChat: process.env.CHANNEL_KICK_CHAT,
+    youtubeChat: process.env.CHANNEL_YOUTUBE_CHAT,
     modActions: process.env.CHANNEL_MOD_ACTIONS,
     commandLog: process.env.COMMAND_LOG_CHANNEL_ID
 };
@@ -133,23 +137,25 @@ const MONITOR_TYPES = [
 ];
 
 const LINKS_FILE = path.join(__dirname, 'twitch_links.json');
+const KICK_LINKS_FILE = path.join(__dirname, 'kick_links.json');
+const YOUTUBE_LINKS_FILE = path.join(__dirname, 'youtube_links.json');
 
-function loadLinks() {
+function loadLinks(file = LINKS_FILE) {
     try {
-        if (fs.existsSync(LINKS_FILE)) {
-            return JSON.parse(fs.readFileSync(LINKS_FILE, 'utf8'));
+        if (fs.existsSync(file)) {
+            return JSON.parse(fs.readFileSync(file, 'utf8'));
         }
     } catch (e) {
-        console.error('Failed to load linked accounts:', e);
+        console.error(`Failed to load linked accounts (${file}):`, e);
     }
     return {};
 }
 
-function saveLinks(links) {
+function saveLinks(links, file = LINKS_FILE) {
     try {
-        fs.writeFileSync(LINKS_FILE, JSON.stringify(links, null, 2));
+        fs.writeFileSync(file, JSON.stringify(links, null, 2));
     } catch (e) {
-        console.error('Failed to save linked accounts:', e);
+        console.error(`Failed to save linked accounts (${file}):`, e);
     }
 }
 
@@ -482,6 +488,439 @@ function startTwitchChatBridge(client) {
     });
 }
 
+// ============================================================================
+// KICK INTEGRATION
+//
+// Kick's public API (docs.kick.com) is OAuth 2.1 + PKCE for user tokens, with
+// a plain refresh_token grant for renewing them server-side. Channel updates
+// and category search are confirmed against Kick's own docs. Live chat and
+// follow/sub events are NOT a pollable feed — Kick only delivers them as
+// signed webhook POSTs to a public HTTPS URL you configure once in your Kick
+// developer app (kick.com/settings/developer), which is why this needs a
+// small HTTP server (KICK_WEBHOOK_PORT) and something in front of it that's
+// reachable from the internet (a reverse proxy, tunnel, or port forward) --
+// see the README for the tunnel setup.
+//
+// Two things below are best-effort rather than 100% confirmed against live
+// traffic, since this couldn't be tested against a real Kick app from here:
+//   1. The exact webhook header names/signature format (verifyKickWebhook).
+//   2. The event names for subscriptions/gifts beyond chat.message.sent and
+//      channel.followed, which ARE confirmed.
+// If verification rejects everything, set KICK_VERIFY_WEBHOOK_SIGNATURE=false
+// in .env to disable it (the bot still works, it just trusts inbound
+// requests instead of cryptographically verifying they're from Kick) and
+// open an issue/PR with what your webhook payloads actually look like.
+
+const kickTokenState = { accessToken: null, expiresAt: 0 };
+let kickPublicKeyCache = null;
+
+function kickConfigured() {
+    return !!(process.env.KICK_CLIENT_ID && process.env.KICK_CLIENT_SECRET && process.env.KICK_REFRESH_TOKEN && process.env.KICK_BROADCASTER_USER_ID);
+}
+
+function kickHttpsRequest(hostname, path, method, headers, body) {
+    return new Promise((resolve, reject) => {
+        const dataString = body ? JSON.stringify(body) : null;
+        const reqHeaders = { ...headers };
+        if (dataString) {
+            reqHeaders['Content-Type'] = 'application/json';
+            reqHeaders['Content-Length'] = Buffer.byteLength(dataString);
+        }
+        const req = https.request({ hostname, path, method, headers: reqHeaders }, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                    try { resolve(data ? JSON.parse(data) : {}); } catch (e) { resolve({}); }
+                } else {
+                    reject(new Error(`Kick API Error (${res.statusCode}): ${data}`));
+                }
+            });
+        });
+        req.on('error', reject);
+        if (dataString) req.write(dataString);
+        req.end();
+    });
+}
+
+async function getKickAccessToken() {
+    if (kickTokenState.accessToken && Date.now() < kickTokenState.expiresAt - 60000) {
+        return kickTokenState.accessToken;
+    }
+    const body = new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: process.env.KICK_CLIENT_ID,
+        client_secret: process.env.KICK_CLIENT_SECRET,
+        refresh_token: process.env.KICK_REFRESH_TOKEN
+    }).toString();
+
+    const json = await new Promise((resolve, reject) => {
+        const req = https.request({
+            hostname: 'id.kick.com',
+            path: '/oauth/token',
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) }
+        }, (res) => {
+            let data = '';
+            res.on('data', c => data += c);
+            res.on('end', () => {
+                try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+            });
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
+
+    if (!json.access_token) throw new Error(`Kick token refresh failed: ${JSON.stringify(json)}`);
+
+    kickTokenState.accessToken = json.access_token;
+    kickTokenState.expiresAt = Date.now() + (json.expires_in || 3600) * 1000;
+    // Kick may rotate the refresh token on use. If it does, the new one only
+    // lives in memory here -- update KICK_REFRESH_TOKEN in .env if you see
+    // refresh failures after a restart.
+    if (json.refresh_token && json.refresh_token !== process.env.KICK_REFRESH_TOKEN) {
+        process.env.KICK_REFRESH_TOKEN = json.refresh_token;
+        console.warn('⚠️ Kick issued a new refresh token. Update KICK_REFRESH_TOKEN in your .env to this value to avoid losing it on restart:', json.refresh_token);
+    }
+    return kickTokenState.accessToken;
+}
+
+async function getKickCategoryId(name) {
+    const token = await getKickAccessToken();
+    const json = await kickHttpsRequest('api.kick.com', `/public/v2/categories?name=${encodeURIComponent(name)}&limit=5`, 'GET', { Authorization: `Bearer ${token}` });
+    if (!json.data || !json.data.length) throw new Error('Kick category not found.');
+    return json.data[0].id;
+}
+
+async function updateKickChannelInfo({ title, categoryId }) {
+    const token = await getKickAccessToken();
+    const payload = {};
+    if (title) payload.stream_title = title;
+    if (categoryId) payload.category_id = categoryId;
+    await kickHttpsRequest('api.kick.com', '/public/v1/channels', 'PATCH', { Authorization: `Bearer ${token}` }, payload);
+    return true;
+}
+
+async function ensureKickEventSubscription() {
+    const token = await getKickAccessToken();
+    try {
+        await kickHttpsRequest('api.kick.com', '/public/v1/events/subscriptions', 'POST', { Authorization: `Bearer ${token}` }, {
+            method: 'webhook',
+            broadcaster_user_id: Number(process.env.KICK_BROADCASTER_USER_ID),
+            events: [
+                { name: 'chat.message.sent', version: 1 },
+                { name: 'channel.followed', version: 1 },
+                { name: 'channel.subscription.new', version: 1 },
+                { name: 'channel.subscription.renewal', version: 1 },
+                { name: 'channel.subscription.gifts', version: 1 }
+            ]
+        });
+        console.log('[Kick] Event subscriptions created.');
+    } catch (e) {
+        // Kick returns an error if you're already subscribed to an event -- that's fine, not fatal.
+        console.log('[Kick] Event subscription request result:', e.message);
+    }
+}
+
+async function getKickPublicKey() {
+    if (kickPublicKeyCache) return kickPublicKeyCache;
+    const token = await getKickAccessToken().catch(() => null);
+    const json = await kickHttpsRequest('api.kick.com', '/public/v1/public-key', 'GET', token ? { Authorization: `Bearer ${token}` } : {});
+    kickPublicKeyCache = json.data?.public_key || json.public_key;
+    return kickPublicKeyCache;
+}
+
+// Best-effort signature check -- see the module comment above. Verifies
+// signature-over(messageId + '.' + timestamp + '.' + rawBody) using RSA-SHA256
+// against Kick's published public key. Toggle off with
+// KICK_VERIFY_WEBHOOK_SIGNATURE=false in .env if this doesn't validate for you.
+async function verifyKickWebhook(headers, rawBody) {
+    if (process.env.KICK_VERIFY_WEBHOOK_SIGNATURE === 'false') return true;
+    try {
+        const messageId = headers['kick-event-message-id'];
+        const timestamp = headers['kick-event-message-timestamp'];
+        const signature = headers['kick-event-signature'];
+        if (!messageId || !timestamp || !signature) return false;
+
+        const publicKey = await getKickPublicKey();
+        if (!publicKey) return false;
+
+        const verifier = crypto.createVerify('RSA-SHA256');
+        verifier.update(`${messageId}.${timestamp}.${rawBody}`);
+        verifier.end();
+        return verifier.verify(publicKey, signature, 'base64');
+    } catch (e) {
+        console.error('[Kick] Webhook signature check error:', e.message);
+        return false;
+    }
+}
+
+async function grantKickRole(discordClient, kickUsername, roleId) {
+    if (!roleId || !kickUsername) return;
+    try {
+        const guild = discordClient.guilds.cache.get(TARGET_GUILD_ID);
+        if (!guild) return;
+        const links = loadLinks(KICK_LINKS_FILE);
+        const discordId = Object.keys(links).find(id => links[id].toLowerCase() === kickUsername.toLowerCase());
+        if (!discordId) return;
+        const member = await guild.members.fetch(discordId).catch(() => null);
+        const role = await guild.roles.fetch(roleId).catch(() => null);
+        if (member && role && !member.roles.cache.has(role.id)) {
+            await member.roles.add(role).catch(() => {});
+        }
+    } catch (e) {
+        console.error('[Kick] Failed to grant role:', e.message);
+    }
+}
+
+function startKickWebhookServer(discordClient) {
+    const port = parseInt(process.env.KICK_WEBHOOK_PORT || '3005', 10);
+
+    const server = http.createServer((req, res) => {
+        if (req.method !== 'POST') {
+            res.writeHead(404).end();
+            return;
+        }
+
+        let rawBody = '';
+        req.on('data', chunk => rawBody += chunk);
+        req.on('end', async () => {
+            // Ack fast -- Kick expects a 2xx within 5 seconds, and will retry otherwise
+            res.writeHead(200).end();
+
+            const headers = {};
+            for (const [k, v] of Object.entries(req.headers)) headers[k.toLowerCase()] = v;
+
+            const valid = await verifyKickWebhook(headers, rawBody);
+            if (!valid) {
+                console.warn('[Kick] Rejected webhook: signature verification failed (or was missing).');
+                return;
+            }
+
+            let payload;
+            try { payload = JSON.parse(rawBody); } catch (e) { return; }
+
+            const eventType = headers['kick-event-type'] || payload.event;
+
+            try {
+                if (eventType === 'chat.message.sent' && CHANNELS.kickChat) {
+                    const guild = discordClient.guilds.cache.get(TARGET_GUILD_ID);
+                    const kickChatChannel = guild ? await guild.channels.fetch(CHANNELS.kickChat).catch(() => null) : null;
+                    if (kickChatChannel) {
+                        const embed = new EmbedBuilder()
+                            .setAuthor({ name: `[Kick] ${payload.sender?.username || 'unknown'}` })
+                            .setDescription(payload.content || '')
+                            .setColor(0x53FC18)
+                            .setTimestamp();
+                        await kickChatChannel.send({ embeds: [embed] });
+                    }
+                } else if (eventType === 'channel.followed') {
+                    const guild = discordClient.guilds.cache.get(TARGET_GUILD_ID);
+                    const logChannel = guild ? await guild.channels.fetch(LOG_CHANNEL_ID).catch(() => null) : null;
+                    if (logChannel) {
+                        const embed = new EmbedBuilder().setDescription(`💚 **${payload.follower?.username || 'Someone'}** followed on Kick!`).setColor(0x53FC18).setTimestamp();
+                        await logChannel.send({ embeds: [embed] });
+                    }
+                } else if (eventType && eventType.startsWith('channel.subscription') && process.env.KICK_SUB_ROLE_ID) {
+                    const username = payload.subscriber?.username || payload.gifter?.username;
+                    if (username) await grantKickRole(discordClient, username, process.env.KICK_SUB_ROLE_ID);
+                    if (Array.isArray(payload.giftees)) {
+                        for (const giftee of payload.giftees) {
+                            await grantKickRole(discordClient, giftee.username, process.env.KICK_SUB_ROLE_ID);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error('[Kick] Error handling webhook event:', e.message);
+            }
+        });
+    });
+
+    server.listen(port, () => {
+        console.log(`[Kick] Webhook server listening on port ${port}. Make sure this is reachable at the URL configured in your Kick developer app.`);
+    });
+}
+
+// ============================================================================
+// YOUTUBE INTEGRATION
+//
+// Uses the YouTube Data API v3 with a standard Google OAuth2 refresh-token
+// flow. Title/category updates and live chat polling are confirmed, stable,
+// well-documented API behavior. Member (subscriber) sync uses the separate
+// Members API, which requires the channel to have memberships enabled AND
+// the youtube.channel-memberships.creator scope -- treat that piece as
+// optional/experimental, since it won't work for every channel.
+
+const youtubeTokenState = { accessToken: null, expiresAt: 0 };
+let youtubeBroadcastCache = { id: null, liveChatId: null, fetchedAt: 0 };
+
+function youtubeConfigured() {
+    return !!(process.env.YOUTUBE_CLIENT_ID && process.env.YOUTUBE_CLIENT_SECRET && process.env.YOUTUBE_REFRESH_TOKEN);
+}
+
+function youtubeHttpsRequest(path, method, body, extraHeaders = {}) {
+    return new Promise(async (resolve, reject) => {
+        const token = await getYouTubeAccessToken();
+        const dataString = body ? JSON.stringify(body) : null;
+        const headers = { Authorization: `Bearer ${token}`, ...extraHeaders };
+        if (dataString) {
+            headers['Content-Type'] = 'application/json';
+            headers['Content-Length'] = Buffer.byteLength(dataString);
+        }
+        const req = https.request({ hostname: 'www.googleapis.com', path, method, headers }, (res) => {
+            let data = '';
+            res.on('data', c => data += c);
+            res.on('end', () => {
+                try {
+                    const json = data ? JSON.parse(data) : {};
+                    if (res.statusCode >= 200 && res.statusCode < 300) resolve(json);
+                    else reject(new Error(`YouTube API Error (${res.statusCode}): ${JSON.stringify(json)}`));
+                } catch (e) { reject(e); }
+            });
+        });
+        req.on('error', reject);
+        if (dataString) req.write(dataString);
+        req.end();
+    });
+}
+
+async function getYouTubeAccessToken() {
+    if (youtubeTokenState.accessToken && Date.now() < youtubeTokenState.expiresAt - 60000) {
+        return youtubeTokenState.accessToken;
+    }
+    const body = new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: process.env.YOUTUBE_CLIENT_ID,
+        client_secret: process.env.YOUTUBE_CLIENT_SECRET,
+        refresh_token: process.env.YOUTUBE_REFRESH_TOKEN
+    }).toString();
+
+    const json = await new Promise((resolve, reject) => {
+        const req = https.request({
+            hostname: 'oauth2.googleapis.com',
+            path: '/token',
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) }
+        }, (res) => {
+            let data = '';
+            res.on('data', c => data += c);
+            res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
+
+    if (!json.access_token) throw new Error(`YouTube token refresh failed: ${JSON.stringify(json)}`);
+    youtubeTokenState.accessToken = json.access_token;
+    youtubeTokenState.expiresAt = Date.now() + (json.expires_in || 3600) * 1000;
+    return youtubeTokenState.accessToken;
+}
+
+async function getActiveYouTubeBroadcast(forceRefresh = false) {
+    if (!forceRefresh && youtubeBroadcastCache.id && Date.now() - youtubeBroadcastCache.fetchedAt < 30000) {
+        return youtubeBroadcastCache;
+    }
+    const json = await youtubeHttpsRequest('/youtube/v3/liveBroadcasts?part=id,snippet&broadcastStatus=active&broadcastType=all', 'GET');
+    const item = json.items?.[0];
+    if (!item) throw new Error('No active YouTube live broadcast found. Start streaming to YouTube first.');
+    youtubeBroadcastCache = { id: item.id, liveChatId: item.snippet.liveChatId, snippet: item.snippet, fetchedAt: Date.now() };
+    return youtubeBroadcastCache;
+}
+
+async function updateYouTubeTitle(title) {
+    const broadcast = await getActiveYouTubeBroadcast(true);
+    await youtubeHttpsRequest(`/youtube/v3/liveBroadcasts?part=snippet&id=${broadcast.id}`, 'PUT', {
+        id: broadcast.id,
+        snippet: { ...broadcast.snippet, title }
+    });
+    return true;
+}
+
+async function getYouTubeCategoryId(categoryName) {
+    const json = await youtubeHttpsRequest('/youtube/v3/videoCategories?part=snippet&regionCode=US', 'GET');
+    const match = json.items?.find(c => c.snippet.title.toLowerCase() === categoryName.toLowerCase());
+    if (!match) throw new Error(`YouTube category "${categoryName}" not found. Categories are fixed platform categories (e.g. "Gaming", "Entertainment"), not free text.`);
+    return match.id;
+}
+
+async function updateYouTubeCategory(categoryId) {
+    const broadcast = await getActiveYouTubeBroadcast(true);
+    const videoJson = await youtubeHttpsRequest(`/youtube/v3/videos?part=snippet&id=${broadcast.id}`, 'GET');
+    const video = videoJson.items?.[0];
+    if (!video) throw new Error('Could not load video details for the active broadcast.');
+    await youtubeHttpsRequest('/youtube/v3/videos?part=snippet', 'PUT', {
+        id: broadcast.id,
+        snippet: { ...video.snippet, categoryId }
+    });
+    return true;
+}
+
+async function startYouTubeChatPoll(discordClient) {
+    let pageToken = undefined;
+
+    async function poll() {
+        let delayMs = 10000;
+        try {
+            const broadcast = await getActiveYouTubeBroadcast();
+            const qs = new URLSearchParams({ part: 'snippet,authorDetails', liveChatId: broadcast.liveChatId });
+            if (pageToken) qs.set('pageToken', pageToken);
+            const json = await youtubeHttpsRequest(`/youtube/v3/liveChat/messages?${qs.toString()}`, 'GET');
+
+            pageToken = json.nextPageToken;
+            delayMs = json.pollingIntervalMillis || 10000;
+
+            if (CHANNELS.youtubeChat && json.items?.length) {
+                const guild = discordClient.guilds.cache.get(TARGET_GUILD_ID);
+                const chatChannel = guild ? await guild.channels.fetch(CHANNELS.youtubeChat).catch(() => null) : null;
+                if (chatChannel) {
+                    for (const item of json.items) {
+                        const embed = new EmbedBuilder()
+                            .setAuthor({ name: `[YouTube] ${item.authorDetails.displayName}` })
+                            .setDescription(item.snippet.displayMessage || '')
+                            .setColor(0xFF0000)
+                            .setTimestamp();
+                        await chatChannel.send({ embeds: [embed] });
+                    }
+                }
+            }
+        } catch (e) {
+            // Most common cause: not currently live. Back off and try again quietly.
+            delayMs = 30000;
+        }
+        setTimeout(poll, delayMs);
+    }
+
+    poll();
+}
+
+async function syncYouTubeMembersToDiscord(discordClient) {
+    if (!process.env.YOUTUBE_SUB_ROLE_ID) return;
+    try {
+        const guild = discordClient.guilds.cache.get(TARGET_GUILD_ID);
+        if (!guild) return;
+        const json = await youtubeHttpsRequest('/youtube/v3/members?part=snippet&mode=all_current&maxResults=1000', 'GET');
+        const memberChannelIds = new Set((json.items || []).map(m => m.snippet.memberDetails.channelId));
+
+        const links = loadLinks(YOUTUBE_LINKS_FILE);
+        const role = await guild.roles.fetch(process.env.YOUTUBE_SUB_ROLE_ID).catch(() => null);
+        if (!role) return;
+
+        await guild.members.fetch().catch(() => {});
+        for (const [discordId, ytChannelId] of Object.entries(links)) {
+            const member = guild.members.cache.get(discordId);
+            if (!member) continue;
+            const isMember = memberChannelIds.has(ytChannelId);
+            if (isMember && !member.roles.cache.has(role.id)) await member.roles.add(role).catch(() => {});
+            else if (!isMember && member.roles.cache.has(role.id)) await member.roles.remove(role).catch(() => {});
+        }
+    } catch (e) {
+        // Members API 403s on channels without memberships enabled -- non-fatal, just skip.
+        console.log('[YouTube] Member sync skipped:', e.message);
+    }
+}
+
 async function buildMasterCommands() {
     // Scan OBS for the current scene list on every startup, so the /obs action
     // dropdown always reflects whatever scenes actually exist right now.
@@ -741,6 +1180,36 @@ const twitchCommands = [
     new SlashCommandBuilder()
         .setName('unlink')
         .setDescription('Unlink your connected Twitch account'),
+    new SlashCommandBuilder()
+        .setName('kickcategory')
+        .setDescription('Change your Kick stream category')
+        .addStringOption(option => option.setName('category').setDescription('Exact category name on Kick').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('kickname')
+        .setDescription('Change your Kick stream title')
+        .addStringOption(option => option.setName('title').setDescription('New stream title').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('linkkick')
+        .setDescription('Link your Kick username to get your sub role automatically')
+        .addStringOption(option => option.setName('username').setDescription('Your exact Kick username').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('unlinkkick')
+        .setDescription('Unlink your connected Kick account'),
+    new SlashCommandBuilder()
+        .setName('youtubecategory')
+        .setDescription('Change your active YouTube live broadcast\'s category')
+        .addStringOption(option => option.setName('category').setDescription('Exact YouTube category name, e.g. "Gaming"').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('youtubename')
+        .setDescription('Change your active YouTube live broadcast\'s title')
+        .addStringOption(option => option.setName('title').setDescription('New stream title').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('linkyoutube')
+        .setDescription('Link your YouTube channel ID to get your member role automatically')
+        .addStringOption(option => option.setName('channel_id').setDescription('Your YouTube channel ID (starts with UC...)').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('unlinkyoutube')
+        .setDescription('Unlink your connected YouTube channel'),
     new SlashCommandBuilder()
         .setName('delete')
         .setDescription('Delete a specified amount of messages in the channel')
@@ -1267,6 +1736,23 @@ twitchClient.once('clientReady', async () => {
         setInterval(() => {
             syncTwitchSubscribersToDiscord(twitchClient).catch(err => console.error('Error syncing subs:', err));
         }, INTERVAL_30_MIN);
+
+        if (kickConfigured()) {
+            startKickWebhookServer(twitchClient);
+            await ensureKickEventSubscription().catch(err => console.error('[Kick] Failed to create event subscriptions:', err.message));
+        } else {
+            console.log('[Kick] Skipped -- KICK_CLIENT_ID/KICK_CLIENT_SECRET/KICK_REFRESH_TOKEN/KICK_BROADCASTER_USER_ID not fully set.');
+        }
+
+        if (youtubeConfigured()) {
+            startYouTubeChatPoll(twitchClient);
+            await syncYouTubeMembersToDiscord(twitchClient);
+            setInterval(() => {
+                syncYouTubeMembersToDiscord(twitchClient).catch(err => console.error('[YouTube] Error syncing members:', err.message));
+            }, INTERVAL_30_MIN);
+        } else {
+            console.log('[YouTube] Skipped -- YOUTUBE_CLIENT_ID/YOUTUBE_CLIENT_SECRET/YOUTUBE_REFRESH_TOKEN not fully set.');
+        }
     } catch (err) {
         console.error('Failed to register twitch commands:', err);
     }
@@ -1276,7 +1762,7 @@ twitchClient.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
     const { commandName, member, user, channel } = interaction;
     
-    const protectedTwitchCommands = ['obsjoin', 'twitchcategory', 'twitchname'];
+    const protectedTwitchCommands = ['obsjoin', 'twitchcategory', 'twitchname', 'kickcategory', 'kickname', 'youtubecategory', 'youtubename'];
     if (protectedTwitchCommands.includes(commandName) && !hasAccess(member)) {
         await logCommandUsage(interaction, { allowed: false });
         return interaction.reply({ content: '❌ Nice try, twin. You don\'t have permission to use this.', flags: [MessageFlags.Ephemeral] });
@@ -1418,6 +1904,112 @@ twitchClient.on('interactionCreate', async interaction => {
             console.error('Twitch Title Error:', err);
             await interaction.editReply(`❌ Failed to update Twitch title: ${err.message}`);
         }
+    }
+
+    if (commandName === 'kickcategory') {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const categoryName = interaction.options.getString('category');
+        try {
+            const categoryId = await getKickCategoryId(categoryName);
+            await updateKickChannelInfo({ categoryId });
+            await interaction.editReply(`💚 Kick category updated to: **${categoryName}**`);
+            await logAction(`💚 **${user.tag}** updated Kick category to: **${categoryName}**`, CHANNELS.kickChat || LOG_CHANNEL_ID);
+        } catch (err) {
+            console.error('Kick Category Error:', err);
+            await interaction.editReply(`❌ Failed to update Kick category: ${err.message}`);
+        }
+    }
+
+    if (commandName === 'kickname') {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const title = interaction.options.getString('title');
+        try {
+            await updateKickChannelInfo({ title });
+            await interaction.editReply(`💚 Kick stream title updated to: **${title}**`);
+            await logAction(`💚 **${user.tag}** updated Kick title to: **${title}**`, CHANNELS.kickChat || LOG_CHANNEL_ID);
+        } catch (err) {
+            console.error('Kick Title Error:', err);
+            await interaction.editReply(`❌ Failed to update Kick title: ${err.message}`);
+        }
+    }
+
+    if (commandName === 'linkkick') {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const kickName = interaction.options.getString('username').trim();
+        const links = loadLinks(KICK_LINKS_FILE);
+        links[user.id] = kickName;
+        saveLinks(links, KICK_LINKS_FILE);
+        await interaction.editReply(`✅ Linked your Discord to Kick account: **${kickName}**! Your sub role is granted automatically the next time Kick sends a subscription event for that username.`);
+        await logAction(`🔗 **${user.tag}** linked their Kick account to \`${kickName}\`.`);
+    }
+
+    if (commandName === 'unlinkkick') {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const links = loadLinks(KICK_LINKS_FILE);
+        let responseText;
+        if (links[user.id]) {
+            delete links[user.id];
+            saveLinks(links, KICK_LINKS_FILE);
+            responseText = `🗑️ Unlinked your Kick account.`;
+        } else {
+            responseText = `⚠️ You don't have a linked Kick account.`;
+        }
+        await interaction.editReply(responseText);
+        await logAction(`🗑️ **${user.tag}** unlinked their Kick account.`);
+    }
+
+    if (commandName === 'youtubecategory') {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const categoryName = interaction.options.getString('category');
+        try {
+            const categoryId = await getYouTubeCategoryId(categoryName);
+            await updateYouTubeCategory(categoryId);
+            await interaction.editReply(`▶️ YouTube category updated to: **${categoryName}**`);
+            await logAction(`▶️ **${user.tag}** updated YouTube category to: **${categoryName}**`, CHANNELS.youtubeChat || LOG_CHANNEL_ID);
+        } catch (err) {
+            console.error('YouTube Category Error:', err);
+            await interaction.editReply(`❌ Failed to update YouTube category: ${err.message}`);
+        }
+    }
+
+    if (commandName === 'youtubename') {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const title = interaction.options.getString('title');
+        try {
+            await updateYouTubeTitle(title);
+            await interaction.editReply(`▶️ YouTube stream title updated to: **${title}**`);
+            await logAction(`▶️ **${user.tag}** updated YouTube title to: **${title}**`, CHANNELS.youtubeChat || LOG_CHANNEL_ID);
+        } catch (err) {
+            console.error('YouTube Title Error:', err);
+            await interaction.editReply(`❌ Failed to update YouTube title: ${err.message}`);
+        }
+    }
+
+    if (commandName === 'linkyoutube') {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const channelId = interaction.options.getString('channel_id').trim();
+        const links = loadLinks(YOUTUBE_LINKS_FILE);
+        links[user.id] = channelId;
+        saveLinks(links, YOUTUBE_LINKS_FILE);
+        await interaction.editReply(`✅ Linked your Discord to YouTube channel: **${channelId}**! Running member sync now...`);
+        await logAction(`🔗 **${user.tag}** linked their YouTube account to \`${channelId}\`.`);
+        await syncYouTubeMembersToDiscord(twitchClient);
+    }
+
+    if (commandName === 'unlinkyoutube') {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const links = loadLinks(YOUTUBE_LINKS_FILE);
+        let responseText;
+        if (links[user.id]) {
+            delete links[user.id];
+            saveLinks(links, YOUTUBE_LINKS_FILE);
+            responseText = `🗑️ Unlinked your YouTube channel.`;
+        } else {
+            responseText = `⚠️ You don't have a linked YouTube channel.`;
+        }
+        await interaction.editReply(responseText);
+        await logAction(`🗑️ **${user.tag}** unlinked their YouTube account.`);
+        await syncYouTubeMembersToDiscord(twitchClient);
     }
 });
 
