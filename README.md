@@ -24,7 +24,7 @@ It was built for one specific problem: sometimes you are not sitting at your PC 
 |---|---|
 | Windows 10 | ✅ Fully supported, what this bot is built and tested against |
 | Windows 11 | ✅ Fully supported — nothing in this bot is Windows-10-specific; DirectShow, WASAPI, and VB-Cable all work the same on 11 |
-| Linux | ⚠️ Partial — see below |
+| Linux | ⚠️ Partial  see below |
 | macOS | ❌ Untested |
 
 Most of `/obs` talks to OBS purely over its WebSocket API, which looks identical to the bot no matter what OS OBS itself is running on — `action`, `sources`, `toggle`, `browser-add/url`, `properties-get/set`, `filters`, `filter-toggle`, `audio`, `profile`, `scene-collection`, `studio-mode`, `transition`, `virtualcam`, and `replay-buffer` should all work against a Linux (or Mac) OBS install already. The Twitch bot side (chat bridge, sub sync, `/link`, `/delete`) is pure Node and has no OS dependency either.
